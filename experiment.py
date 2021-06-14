@@ -12,6 +12,7 @@ import math
 import os
 import random
 import sys
+from sys import intern
 
 from collections import defaultdict, namedtuple
 
@@ -47,9 +48,11 @@ class SpacedRepetitionModel(object):
         self.sigma = sigma
 
     def halflife(self, inst, base):
+        # [print(self.weights[k], x_k) for (k, x_k) in inst.fv]
         try:
             dp = sum([self.weights[k]*x_k for (k, x_k) in inst.fv])
             return hclip(base ** dp)
+            # return hclip(dp)
         except:
             return MAX_HALF_LIFE
 
@@ -76,23 +79,28 @@ class SpacedRepetitionModel(object):
             dp = sum([self.weights[k]*x_k for (k, x_k) in inst.fv])
             p = 1./(1+math.exp(-dp))
             return pclip(p), random.random()
+        elif self.method == 'custom':
+            h = self.halflife(inst, base)
+            p = 2.** (-inst.t/h)
+            return pclip(p), h
         else:
             raise Exception
 
     def train_update(self, inst):
-        if self.method == 'hlr':
+        if self.method == 'hlr' or self.method=='custom':
             base = 2.
             p, h = self.predict(inst, base)
+            #computed loss derivatives. I checked them and they check out.
             dlp_dw = 2.*(p-inst.p)*(LN2**2)*p*(inst.t/h)
             dlh_dw = 2.*(h-inst.h)*LN2*h
             for (k, x_k) in inst.fv:
                 rate = (1./(1+inst.p)) * self.lrate / math.sqrt(1 + self.fcounts[k])
                 # rate = self.lrate / math.sqrt(1 + self.fcounts[k])
-                # sl(p) update
-                self.weights[k] -= rate * dlp_dw * x_k
+                ## sl(p) update
+                # self.weights[k] -= rate * dlp_dw * x_k
                 # sl(h) update
                 if not self.omit_h_term:
-                    self.weights[k] -= rate * self.hlwt * dlh_dw * x_k
+                    self.weights[k] -= rate * dlh_dw * x_k #* self.hlwt
                 # L2 regularization update
                 self.weights[k] -= rate * self.l2wt * self.weights[k] / self.sigma**2
                 # increment feature count for learning rate
@@ -135,6 +143,17 @@ class SpacedRepetitionModel(object):
             results['hh'].append(h)
             results['slp'].append(slp)      # loss function values
             results['slh'].append(slh)
+        
+        inst = testset[0]
+        slp, slh, p, h = self.losses(inst)
+        print("Pred_h: {}".format(h))
+        print("Weights: {}".format(self.weights))
+        print("Feature Vec: {}".format(inst.fv))
+        print("Actual h: {}".format(inst.h))
+
+        print(sum(results["h"])/len(results["h"]))
+        print(sum(results['hh'])/len(results["hh"]))
+        print("-----")
         mae_p = mae(results['p'], results['pp'])
         mae_h = mae(results['h'], results['hh'])
         cor_p = spearmanr(results['p'], results['pp'])
@@ -150,19 +169,20 @@ class SpacedRepetitionModel(object):
             mae_p, cor_p, mae_h, cor_h))
 
     def dump_weights(self, fname):
-        with open(fname, 'wb') as f:
-            for (k, v) in self.weights.iteritems():
+        with open(fname, 'w') as f:
+            for (k, v) in self.weights.items\
+                        ():
                 f.write('%s\t%.4f\n' % (k, v))
 
     def dump_predictions(self, fname, testset):
-        with open(fname, 'wb') as f:
+        with open(fname, 'w') as f:
             f.write('p\tpp\th\thh\tlang\tuser_id\ttimestamp\n')
             for inst in testset:
                 pp, hh = self.predict(inst)
                 f.write('%.4f\t%.4f\t%.4f\t%.4f\t%s\t%s\t%d\n' % (inst.p, pp, inst.h, hh, inst.lang, inst.uid, inst.ts))
 
     def dump_detailed_predictions(self, fname, testset):
-        with open(fname, 'wb') as f:
+        with open(fname, 'w') as f:
             f.write('p\tpp\th\thh\tlang\tuser_id\ttimestamp\tlexeme_tag\n')
             for inst in testset:
                 pp, hh = self.predict(inst)
@@ -203,6 +223,8 @@ def spearmanr(l1, l2):
         num += (l1[i]-m1)*(l2[i]-m2)
         d1 += (l1[i]-m1)**2
         d2 += (l2[i]-m2)**2
+    print(d1)
+    print(d2)
     return num/math.sqrt(d1*d2)
 
 
@@ -211,15 +233,17 @@ def read_data(input_file, method, omit_bias=False, omit_lexemes=False, max_lines
     sys.stderr.write('reading data...')
     instances = list()
     if input_file.endswith('gz'):
-        f = gzip.open(input_file, 'rb')
+        f = gzip.open(input_file, 'rt')
     else:
-        f = open(input_file, 'rb')
+        print(input_file)
+        f = open(input_file, 'rt')
     reader = csv.DictReader(f)
     for i, row in enumerate(reader):
         if max_lines is not None and i >= max_lines:
             break
         p = pclip(float(row['p_recall']))
         t = float(row['delta'])/(60*60*24)  # convert time delta to days
+        
         h = hclip(-t/(math.log(p, 2)))
         lang = '%s->%s' % (row['ui_language'], row['learning_language'])
         lexeme_id = row['lexeme_id']
@@ -231,6 +255,13 @@ def read_data(input_file, method, omit_bias=False, omit_lexemes=False, max_lines
         wrong = seen - right
         right_this = int(row['session_correct'])
         wrong_this = int(row['session_seen']) - right_this
+        if (i%1e6 == 0):
+            print("Seconds: {}".format(row["delta"]))
+            print("Days: {}".format(t))
+            print("Right: {}".format(right))
+            print("Wrong: {}".format(wrong))
+            print("Session Right: {}".format(right_this))
+            print("Session Wrong: {}".format(wrong_this))
         # feature vector is a list of (feature, value) tuples
         fv = []
         # core features based on method
@@ -238,6 +269,15 @@ def read_data(input_file, method, omit_bias=False, omit_lexemes=False, max_lines
             fv.append((intern('diff'), right-wrong))
         elif method == 'pimsleur':
             fv.append((intern('total'), right+wrong))
+        elif method == 'custom':
+            # fv.append((intern('right'), right))
+            # fv.append((intern('wrong'), wrong))
+            # fv.append((intern('session_right'), right_this))
+            # fv.append((intern("session_wrong"), wrong_this))
+            fv.append((intern('right'), math.sqrt(1+right)))
+            fv.append((intern('wrong'), math.sqrt(1+wrong)))
+            fv.append((intern('session_right'), math.sqrt(1+right_this)))
+            fv.append((intern("session_wrong"), math.sqrt(1+wrong_this)))
         else:
             # fv.append((intern('right'), right))
             # fv.append((intern('wrong'), wrong))
@@ -250,7 +290,8 @@ def read_data(input_file, method, omit_bias=False, omit_lexemes=False, max_lines
             fv.append((intern('bias'), 1.))
         if not omit_lexemes:
             fv.append((intern('%s:%s' % (row['learning_language'], lexeme_string)), 1.))
-        instances.append(Instance(p, t, fv, h, (right+2.)/(seen+4.), lang, right_this, wrong_this, timestamp, user_id, lexeme_string))
+        if t < 50:
+            instances.append(Instance(p, t, fv, h, (right+2.)/(seen+4.), lang, right_this, wrong_this, timestamp, user_id, lexeme_string))
         if i % 1000000 == 0:
             sys.stderr.write('%d...' % i)
     sys.stderr.write('done!\n')
@@ -262,7 +303,7 @@ argparser = argparse.ArgumentParser(description='Fit a SpacedRepetitionModel to 
 argparser.add_argument('-b', action="store_true", default=False, help='omit bias feature')
 argparser.add_argument('-l', action="store_true", default=False, help='omit lexeme features')
 argparser.add_argument('-t', action="store_true", default=False, help='omit half-life term')
-argparser.add_argument('-m', action="store", dest="method", default='hlr', help="hlr, lr, leitner, pimsleur")
+argparser.add_argument('-m', action="store", dest="method", default='hlr', help="hlr, lr, leitner, pimsleur, custom")
 argparser.add_argument('-x', action="store", dest="max_lines", type=int, default=None, help="maximum number of lines to read (for dev)")
 argparser.add_argument('input_file', action="store", help='log file for training')
 
@@ -289,16 +330,19 @@ if __name__ == "__main__":
     model = SpacedRepetitionModel(method=args.method, omit_h_term=args.t)
     model.train(trainset)
     model.eval(testset, 'test')
+    print("Finished Evaluation.")
 
     # write out model weights and predictions
     filebits = [args.method] + \
-        [k for k, v in sorted(vars(args).iteritems()) if v is True] + \
+        [k for k, v in sorted(vars(args).items()) if v is True] + \
         [os.path.splitext(os.path.basename(args.input_file).replace('.gz', ''))[0]]
     if args.max_lines is not None:
         filebits.append(str(args.max_lines))
     filebase = '.'.join(filebits)
     if not os.path.exists('results/'):
         os.makedirs('results/')
+    print("Writing weights...")
+
     model.dump_weights('results/'+filebase+'.weights')
     model.dump_predictions('results/'+filebase+'.preds', testset)
     # model.dump_detailed_predictions('results/'+filebase+'.detailed', testset)
